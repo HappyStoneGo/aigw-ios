@@ -1,0 +1,99 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'Bundle ID'
+        required: false
+        default: com.aigw.ios
+      display_name:
+        description: 'App 显示名'
+        required: false
+        default: AI聚合网关
+      server_url:
+        description: '默认服务器地址（编译期写入）'
+        required: false
+        default: http://127.0.0.1
+
+jobs:
+  build:
+    name: xcodebuild (unsigned)
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Apply inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -e
+          P=AIGW/Info.plist
+          if [ -n "${{ inputs.bundle_id }}" ]; then
+            sed -i '' "s/com.aigw.ios/${{ inputs.bundle_id }}/g" AIGW.xcodeproj/project.pbxproj
+          fi
+          if [ -n "${{ inputs.display_name }}" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${{ inputs.display_name }}" "$P" || true
+          fi
+          if [ -n "${{ inputs.server_url }}" ]; then
+            sed -i '' "s|http://127.0.0.1|${{ inputs.server_url }}|g" AIGW/Net/ApiClient.swift
+          fi
+
+      - name: Archive (no signing)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project AIGW.xcodeproj \
+            -scheme AIGW \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/AIGW.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive | tail -60
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP="$RUNNER_TEMP/AIGW.xcarchive/Products/Applications/AIGW.app"
+          ls -la "$APP"
+          rm -rf "$RUNNER_TEMP/Payload"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          # 确保可执行位
+          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          chmod 755 "$RUNNER_TEMP/Payload/AIGW.app/$EXE"
+          cd "$RUNNER_TEMP"
+          zip -qry AIGW-unsigned.ipa Payload
+          shasum -a 256 AIGW-unsigned.ipa | tee AIGW-unsigned.ipa.sha256
+          unzip -l AIGW-unsigned.ipa | head -20
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIGW-unsigned-ipa
+          path: |
+            ${{ runner.temp }}/AIGW-unsigned.ipa
+            ${{ runner.temp }}/AIGW-unsigned.ipa.sha256
+          retention-days: 30
+
+      - name: Upload dSYM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIGW-dsym
+          path: ${{ runner.temp }}/AIGW.xcarchive/dSYMs
+          if-no-files-found: ignore
+          retention-days: 7
